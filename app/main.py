@@ -26,7 +26,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db = Database(settings.data_dir / "db.sqlite3")
     store = ChunkStore(settings.data_dir)
     reconcile(db, store)
-    service = UploadService(db, store)
+    service = UploadService(
+        db,
+        store,
+        checkpoint_bytes=settings.finalize_checkpoint_bytes,
+        lease_ttl_seconds=settings.finalize_lease_ttl_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

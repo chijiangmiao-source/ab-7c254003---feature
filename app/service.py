@@ -1,27 +1,66 @@
-"""Core upload/resume/finalize logic shared by the HTTP routes."""
+"""Core upload/resume/finalize logic shared by the HTTP routes.
+
+Finalization is a crash-resumable, lease-fenced protocol:
+
+- assembly streams chunk files onto a deterministic temp file, persisting a
+  checkpoint (confirmed byte count + serializable SHA-256 state) only after
+  the corresponding output bytes are fsynced;
+- a persistent lease (renewed by the database clock) and a strictly
+  increasing fence generation coordinate concurrent finalizers — a stale
+  generation can no longer advance checkpoints, publish, or complete;
+- the publish phase records its intent before the atomic rename, and the
+  completion transaction covers both tables, so every crash window converges
+  on the next call without re-assembling or exposing half-finished output.
+"""
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterable
+from typing import AsyncIterable, Callable
 
 from . import clock
 from .bitmap import count_set, missing_indices, new_bitmap, set_bit
-from .db import Database
+from .db import CHECKPOINT_VERSION, Database
 from .errors import ApiError
+from .resumable_hash import ResumableSha256
 from .schemas import CreateSessionRequest
 from .storage import ChunkStore
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# finalization states (persisted)
+F_IDLE = "idle"
+F_ASSEMBLING = "assembling"
+F_PUBLISHING = "publishing"
+F_COMPLETED = "completed"
+F_FAILED = "failed"
+
+
+class LeaseLost(Exception):
+    """A fenced write matched no row: another generation took over."""
+
 
 class UploadService:
-    def __init__(self, db: Database, store: ChunkStore):
+    def __init__(
+        self,
+        db: Database,
+        store: ChunkStore,
+        *,
+        checkpoint_bytes: int = 1 << 20,
+        lease_ttl_seconds: float = 10.0,
+        checkpoint_hook: Callable[[str, int], None] | None = None,
+    ):
         self.db = db
         self.store = store
+        self.checkpoint_bytes = checkpoint_bytes
+        self.lease_ttl_seconds = lease_ttl_seconds
+        # test/observability hook invoked after every committed checkpoint
+        self._checkpoint_hook = checkpoint_hook
 
     # ---- sessions ----
 
@@ -158,6 +197,20 @@ class UploadService:
         if session["status"] == "completed" and self.store.artifact_path(session_id).exists():
             return self._finalize_receipt(session)
 
+        fin = self.db.ensure_finalization(session_id, session["file_size"], self._now_iso())
+
+        if fin["state"] == F_FAILED:
+            # integrity failures and recovery errors are deterministic: replay
+            raise self._stored_error(fin)
+        if fin["state"] == F_COMPLETED:
+            # The completion transaction covers both tables, so reaching here
+            # means the artifact or the session row was lost out of band.
+            raise self._recovery_error(
+                session, fin, "finalization is completed but the session row or artifact is missing"
+            )
+
+        self._validate_checkpoint(session, fin)
+
         total = session["total_chunks"]
         missing = missing_indices(session["bitmap"], total)
         if missing:
@@ -175,13 +228,7 @@ class UploadService:
                 )
             raise ApiError(409, "CHUNKS_INCOMPLETE", "cannot finalize; chunks are missing", details)
 
-        paths, lost = [], []
-        for i in range(total):
-            path = self.store.chunk_path(session_id, i)
-            if path.exists():
-                paths.append(path)
-            else:
-                lost.append(i)
+        lost = [i for i in range(total) if not self.store.chunk_path(session_id, i).exists()]
         if lost:
             raise ApiError(
                 409,
@@ -190,24 +237,62 @@ class UploadService:
                 {"missing_chunks": lost, "total_chunks": total},
             )
 
-        tmp, size, digest = self.store.assemble_to_tmp(paths)
-        if size != session["file_size"] or digest != session["file_sha256"]:
-            self.store.discard(tmp)
-            raise ApiError(
-                422,
-                "INTEGRITY_MISMATCH",
-                "assembled file does not match the declared SHA-256; uploaded chunks are kept",
-                {
-                    "declared_sha256": session["file_sha256"],
-                    "assembled_sha256": digest,
-                    "declared_size": session["file_size"],
-                    "assembled_size": size,
-                },
-            )
-        final = self.store.publish(tmp, session_id)
-        completed_at = clock.utcnow().isoformat()
-        self.db.mark_completed(session_id, completed_at, digest, str(final))
+        owner = uuid.uuid4().hex
+        fin = self.db.try_acquire_lease(
+            session_id, owner, self.lease_ttl_seconds, session["file_size"], self._now_iso()
+        )
+        if fin is None:
+            raise self._in_progress(session_id)
+        try:
+            if fin["state"] == F_PUBLISHING and fin["publish_intent"]:
+                self._converge_publish(session, fin, owner)
+            else:
+                digest = self._assemble(session, fin, owner)
+                self._publish(session, fin, owner, digest)
+        except LeaseLost:
+            raise self._in_progress(session_id)
         return self._finalize_receipt(self.get_session_or_404(session_id))
+
+    def finalization_status(self, session_id: str) -> dict:
+        """Read-only view of the durable finalization state (never regresses)."""
+        session = self.get_session_or_404(session_id)
+        fin = self.db.get_finalization(session_id)
+        if fin is None:
+            completed = session["status"] == "completed"
+            return {
+                "session_id": session_id,
+                "state": F_COMPLETED if completed else F_IDLE,
+                "confirmed_bytes": session["file_size"] if completed else 0,
+                "total_bytes": session["file_size"],
+                "generation": 0,
+                "last_error": None,
+                "lease_expires_at": None,
+                "updated_at": None,
+            }
+        last_error = None
+        if fin["last_error"]:
+            try:
+                payload = json.loads(fin["last_error"])
+                last_error = {
+                    "code": payload["code"],
+                    "message": payload["message"],
+                    "details": payload.get("details") or {},
+                }
+            except (ValueError, KeyError, TypeError):
+                last_error = {"code": "UNREADABLE_ERROR", "message": str(fin["last_error"]), "details": {}}
+        lease_expires_at = None
+        if fin["lease_expires_at"] is not None:
+            lease_expires_at = datetime.fromtimestamp(fin["lease_expires_at"], tz=timezone.utc).isoformat()
+        return {
+            "session_id": session_id,
+            "state": fin["state"],
+            "confirmed_bytes": fin["confirmed_bytes"],
+            "total_bytes": fin["total_bytes"],
+            "generation": fin["generation"],
+            "last_error": last_error,
+            "lease_expires_at": lease_expires_at,
+            "updated_at": fin["updated_at"],
+        }
 
     def artifact_file(self, session_id: str) -> tuple[Path, str]:
         session = self.get_session_or_404(session_id)
@@ -220,6 +305,213 @@ class UploadService:
                 {"status": self._derived_status(session)},
             )
         return path, session["final_sha256"]
+
+    # ---- finalize internals ----
+
+    def _validate_checkpoint(self, session: dict, fin: dict) -> None:
+        """Read-only validation of the recoverable state.
+
+        Anything unknown or inconsistent becomes a persisted ``failed`` state
+        with a structured recovery error; progress is never guessed.
+        """
+        state = fin["state"]
+        if state == F_IDLE:
+            return
+        if fin["checkpoint_version"] != CHECKPOINT_VERSION:
+            raise self._recovery_error(
+                session, fin, f"unknown checkpoint version {fin['checkpoint_version']}"
+            )
+        confirmed = fin["confirmed_bytes"]
+        total = session["file_size"]
+        if confirmed < 0 or confirmed > total:
+            raise self._recovery_error(
+                session, fin, f"confirmed_bytes {confirmed} is outside 0..{total}"
+            )
+        if confirmed > 0:
+            try:
+                ResumableSha256.from_state(fin["hasher_state"] or b"")
+            except ValueError as exc:
+                raise self._recovery_error(session, fin, f"hasher checkpoint is unreadable: {exc}")
+        tmp = self.store.finalize_tmp_path(session["session_id"])
+        if state == F_ASSEMBLING:
+            if confirmed > 0:
+                if not tmp.exists():
+                    raise self._recovery_error(session, fin, "finalization temp file is missing")
+                if tmp.stat().st_size < confirmed:
+                    raise self._recovery_error(
+                        session,
+                        fin,
+                        "finalization temp file is shorter than the committed checkpoint",
+                    )
+        elif state == F_PUBLISHING:
+            if not fin["publish_intent"] or not fin["final_sha256"]:
+                raise self._recovery_error(
+                    session, fin, "publishing state without a recorded publish intent"
+                )
+            if tmp.exists():
+                if tmp.stat().st_size != total:
+                    raise self._recovery_error(
+                        session, fin, "finalization temp file size does not match the declared file size"
+                    )
+            elif not self.store.artifact_path(session["session_id"]).exists():
+                raise self._recovery_error(
+                    session, fin, "publish intent recorded but both temp file and artifact are missing"
+                )
+
+    def _assemble(self, session: dict, fin: dict, owner: str) -> str:
+        """Stream the remaining source bytes onto the checkpointed temp file.
+
+        Resumes exactly at ``confirmed_bytes``: the confirmed prefix is never
+        truncated or re-read; only the unconfirmed tail (written but not yet
+        checkpointed) is discarded before appending.
+        """
+        session_id = session["session_id"]
+        total = session["file_size"]
+        confirmed = fin["confirmed_bytes"]
+        hasher = ResumableSha256.from_state(fin["hasher_state"]) if confirmed else ResumableSha256()
+        tmp = self.store.finalize_tmp_path(session_id)
+        generation = fin["generation"]
+        offset = confirmed
+        with open(tmp, "r+b" if tmp.exists() else "wb") as out:
+            out.truncate(confirmed)  # drop only the unconfirmed tail
+            out.seek(confirmed)
+            since_checkpoint = 0
+            for block in self.store.read_chunks_from(session_id, session["chunk_size"], total, offset):
+                out.write(block)
+                hasher.update(block)
+                offset += len(block)
+                since_checkpoint += len(block)
+                if since_checkpoint >= self.checkpoint_bytes:
+                    self._commit_checkpoint(session_id, generation, owner, out, offset, hasher)
+                    since_checkpoint = 0
+            # final checkpoint: every output byte is durable before this commit
+            self._commit_checkpoint(session_id, generation, owner, out, offset, hasher)
+        digest = hasher.hexdigest()
+        if offset != total or digest != session["file_sha256"]:
+            error = {
+                "status_code": 422,
+                "code": "INTEGRITY_MISMATCH",
+                "message": "assembled file does not match the declared SHA-256; uploaded chunks are kept",
+                "details": {
+                    "declared_sha256": session["file_sha256"],
+                    "assembled_sha256": digest,
+                    "declared_size": total,
+                    "assembled_size": offset,
+                },
+            }
+            if not self.db.fail_finalization(session_id, generation, owner, json.dumps(error), self._now_iso()):
+                raise LeaseLost
+            # the failed state is terminal, so the rejected output can go;
+            # confirmed chunks are of course kept
+            self.store.discard(tmp)
+            raise ApiError(422, error["code"], error["message"], error["details"])
+        return digest
+
+    def _commit_checkpoint(
+        self, session_id: str, generation: int, owner: str, out, offset: int, hasher: ResumableSha256
+    ) -> None:
+        # the checkpoint may only advance after the output bytes are durable
+        out.flush()
+        os.fsync(out.fileno())
+        ok = self.db.advance_checkpoint(
+            session_id, generation, owner, offset, hasher.state(), self.lease_ttl_seconds, self._now_iso()
+        )
+        if not ok:
+            raise LeaseLost
+        if self._checkpoint_hook is not None:
+            self._checkpoint_hook(session_id, offset)
+
+    def _publish(self, session: dict, fin: dict, owner: str, digest: str) -> None:
+        session_id = session["session_id"]
+        generation = fin["generation"]
+        # crash window 1: the intent is durable before the rename; a restart
+        # finds the temp file and re-does the rename.
+        if not self.db.declare_publish_intent(
+            session_id, generation, owner, digest, self.lease_ttl_seconds, self._now_iso()
+        ):
+            raise LeaseLost
+        final = self.store.publish(self.store.finalize_tmp_path(session_id), session_id)
+        # crash window 2: rename done, completion not committed; a restart
+        # verifies the artifact and completes without re-assembling.
+        if not self.db.complete_finalization(
+            session_id, generation, owner, self._now_iso(), digest, str(final), self._now_iso()
+        ):
+            raise LeaseLost
+
+    def _converge_publish(self, session: dict, fin: dict, owner: str) -> None:
+        """Converge a publish-phase crash window without re-assembling."""
+        session_id = session["session_id"]
+        tmp = self.store.finalize_tmp_path(session_id)
+        artifact = self.store.artifact_path(session_id)
+        if tmp.exists():
+            # intent was recorded but the rename never happened: the temp file
+            # holds the fully assembled, checkpointed bytes -> publish them
+            final = self.store.publish(tmp, session_id)
+        else:
+            # rename happened but the completion transaction did not commit:
+            # only a byte-identical artifact may be recovered into completed
+            size, digest = self.store.sha256_of(artifact)
+            if size != session["file_size"] or digest != session["file_sha256"]:
+                raise self._recovery_error(
+                    session, fin, "published artifact does not match the declared size and SHA-256"
+                )
+            final = artifact
+        if not self.db.complete_finalization(
+            session_id, fin["generation"], owner, self._now_iso(), session["file_sha256"], str(final), self._now_iso()
+        ):
+            raise LeaseLost
+
+    def _recovery_error(self, session: dict, fin: dict, reason: str) -> ApiError:
+        error = {
+            "status_code": 409,
+            "code": "FINALIZATION_RECOVERY_ERROR",
+            "message": f"finalization state is not recoverable: {reason}",
+            "details": {
+                "session_id": session["session_id"],
+                "state": fin["state"],
+                "generation": fin["generation"],
+                "confirmed_bytes": fin["confirmed_bytes"],
+                "reason": reason,
+            },
+        }
+        self.db.force_fail_finalization(session["session_id"], json.dumps(error), self._now_iso())
+        return ApiError(409, error["code"], error["message"], error["details"])
+
+    @staticmethod
+    def _stored_error(fin: dict) -> ApiError:
+        try:
+            payload = json.loads(fin["last_error"] or "")
+            return ApiError(
+                payload["status_code"], payload["code"], payload["message"], payload.get("details") or {}
+            )
+        except (ValueError, KeyError, TypeError):
+            return ApiError(
+                409,
+                "FINALIZATION_RECOVERY_ERROR",
+                "finalization failed and its recorded error is unreadable",
+                {"state": fin["state"]},
+            )
+
+    def _in_progress(self, session_id: str) -> ApiError:
+        fin = self.db.get_finalization(session_id) or {}
+        lease_expires_at = fin.get("lease_expires_at")
+        now = self.db.db_now()
+        retry_after = max(0.0, (lease_expires_at or now) - now)
+        return ApiError(
+            409,
+            "FINALIZATION_IN_PROGRESS",
+            "finalization is already running under a different lease; retry after it expires",
+            {
+                "session_id": session_id,
+                "state": fin.get("state"),
+                "generation": fin.get("generation"),
+                "retry_after": round(retry_after, 3),
+            },
+        )
+
+    @staticmethod
+    def _now_iso() -> str:
+        return clock.utcnow().isoformat()
 
     # ---- helpers ----
 
@@ -302,6 +594,10 @@ def reconcile(db: Database, store: ChunkStore) -> None:
     - chunk files without a matching row (crashed before commit) are removed;
     - the persisted bitmap is rebuilt from the surviving rows;
     - leftover temp files are removed.
+
+    Finalization rows are *not* rewritten here: their crash windows converge
+    lazily (and deterministically) on the next finalize call, so confirmed
+    progress never regresses across a restart.
 
     Net effect: confirmed chunks are never reported missing, and unconfirmed
     bytes are never reported as received.

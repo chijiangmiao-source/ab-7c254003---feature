@@ -2,6 +2,10 @@
 
 Every write goes to a temp file, is fsynced, and is then moved into place with
 os.replace so a crash never leaves a half-written file at a final path.
+
+The finalization temp file is the single exception to the random-temp rule:
+its path is derived from the session id so that a restarted process keeps
+appending to the *same* file its checkpoint refers to.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import hashlib
 import os
 import uuid
 from pathlib import Path
-from typing import AsyncIterable, Iterable
+from typing import AsyncIterable, Iterator
 
 _COPY_BUFFER = 1024 * 1024
 
@@ -31,6 +35,10 @@ class ChunkStore:
 
     def artifact_path(self, session_id: str) -> Path:
         return self.artifacts_dir / f"{session_id}.bin"
+
+    def finalize_tmp_path(self, session_id: str) -> Path:
+        """Deterministic path of the resumable finalization output."""
+        return self.artifacts_dir / f".{session_id}.finalizing"
 
     async def write_chunk_tmp(self, session_id: str, stream: AsyncIterable[bytes]) -> tuple[Path, int, str]:
         """Stream a request body to a temp file; returns (tmp_path, size, sha256).
@@ -62,34 +70,46 @@ class ChunkStore:
         os.replace(tmp, final)
         _fsync_dir(final.parent)
 
-    def assemble_to_tmp(self, paths: Iterable[Path]) -> tuple[Path, int, str]:
-        """Concatenate chunk files in order; returns (tmp_path, size, sha256)."""
-        tmp = self.artifacts_dir / f".{uuid.uuid4().hex}.tmp"
-        hasher = hashlib.sha256()
-        size = 0
-        try:
-            with open(tmp, "wb") as out:
-                for path in paths:
-                    with open(path, "rb") as src:
-                        while True:
-                            block = src.read(_COPY_BUFFER)
-                            if not block:
-                                break
-                            hasher.update(block)
-                            out.write(block)
-                            size += len(block)
-                out.flush()
-                os.fsync(out.fileno())
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-        return tmp, size, hasher.hexdigest()
+    def read_chunks_from(
+        self, session_id: str, chunk_size: int, total_bytes: int, offset: int
+    ) -> Iterator[bytes]:
+        """Stream assembled bytes starting at absolute ``offset``.
+
+        Used to resume a finalization: source bytes before ``offset`` were
+        already checked and are never re-read.  Yields at most _COPY_BUFFER
+        bytes at a time; stops short if a chunk file shrank unexpectedly (the
+        caller's digest/length check then fails).
+        """
+        while offset < total_bytes:
+            index, inner = divmod(offset, chunk_size)
+            size = min(_COPY_BUFFER, chunk_size - inner, total_bytes - offset)
+            with open(self.chunk_path(session_id, index), "rb") as src:
+                src.seek(inner)
+                block = src.read(size)
+            if not block:
+                return
+            yield block
+            offset += len(block)
 
     def publish(self, tmp: Path, session_id: str) -> Path:
         final = self.artifact_path(session_id)
         os.replace(tmp, final)
         _fsync_dir(final.parent)
         return final
+
+    @staticmethod
+    def sha256_of(path: Path) -> tuple[int, str]:
+        """Stream a file through SHA-256; returns (size, hexdigest)."""
+        hasher = hashlib.sha256()
+        size = 0
+        with open(path, "rb") as fh:
+            while True:
+                block = fh.read(_COPY_BUFFER)
+                if not block:
+                    break
+                hasher.update(block)
+                size += len(block)
+        return size, hasher.hexdigest()
 
     @staticmethod
     def discard(path: Path) -> None:

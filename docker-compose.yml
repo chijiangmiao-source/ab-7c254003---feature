@@ -4,6 +4,10 @@ services:
     image: chunked-upload-api:latest
     environment:
       DATA_DIR: /data
+      # small checkpoints + short lease so the acceptance run exercises
+      # several checkpoints and a fast post-crash takeover
+      FINALIZE_CHECKPOINT_BYTES: "262144"
+      FINALIZE_LEASE_TTL_SECONDS: "2"
     volumes:
       - upload-data:/data
     ports:
@@ -23,6 +27,11 @@ services:
         condition: service_healthy
     environment:
       API_BASE_URL: http://api:8000
+      VERIFY_DOCKER_SOCKET: /var/run/docker.sock
+    volumes:
+      # lets the acceptance client SIGKILL and restart the api container to
+      # prove crash recovery; without it that section is skipped
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["python", "-m", "app.verify"]
     restart: "no"
 

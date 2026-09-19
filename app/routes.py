@@ -34,6 +34,10 @@ def build_router(service: UploadService) -> APIRouter:
     def finalize(session_id: str) -> dict:
         return service.finalize(session_id)
 
+    @router.get("/sessions/{session_id}/finalization")
+    def finalization_status(session_id: str) -> dict:
+        return service.finalization_status(session_id)
+
     @router.get("/sessions/{session_id}/artifact")
     def download_artifact(session_id: str) -> FileResponse:
         path, sha256 = service.artifact_file(session_id)
