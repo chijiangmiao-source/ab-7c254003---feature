@@ -1,18 +1,54 @@
 """On-disk layout for chunk bodies and published artifacts.
 
-Every write goes to a temp file, is fsynced, and is then moved into place with
-os.replace so a crash never leaves a half-written file at a final path.
+Chunk bodies land via a temp file that is fsynced and then ``os.replace``d into
+place.  Finalization keeps its own stable, per-session temp file under
+``.finalize/`` so that a restart can continue appending at the confirmed byte
+boundary; publishing goes through a generation-tagged hard link (candidate)
+that is atomically renamed over the final path.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import uuid
 from pathlib import Path
-from typing import AsyncIterable, Iterable
+from typing import AsyncIterable
 
 _COPY_BUFFER = 1024 * 1024
+FINALIZE_DIRNAME = ".finalize"
+
+
+class CheckpointFileError(Exception):
+    """The finalization temp file contradicts the persisted checkpoint."""
+
+    def __init__(self, reason: str, *, expected: int = 0, actual: int = 0):
+        super().__init__(reason)
+        self.reason = reason
+        self.expected = expected
+        self.actual = actual
+
+
+class FinalizeWriter:
+    """Append handle on the stable finalization temp file."""
+
+    def __init__(self, fh, path: Path, position: int):
+        self._fh = fh
+        self.path = path
+        self.position = position
+
+    def write(self, data: bytes) -> int:
+        self._fh.write(data)
+        self.position += len(data)
+        return self.position
+
+    def sync(self) -> None:
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def fileno(self) -> int:
+        return self._fh.fileno()
 
 
 class ChunkStore:
@@ -20,6 +56,7 @@ class ChunkStore:
         self.root = root
         self.chunks_root = root / "chunks"
         self.artifacts_dir = root / "artifacts"
+        self.finalize_dir = root / FINALIZE_DIRNAME
         self.chunks_root.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -31,6 +68,12 @@ class ChunkStore:
 
     def artifact_path(self, session_id: str) -> Path:
         return self.artifacts_dir / f"{session_id}.bin"
+
+    def finalize_tmp_path(self, session_id: str) -> Path:
+        return self.finalize_dir / f"{session_id}.tmp"
+
+    def candidate_path(self, session_id: str, generation: int) -> Path:
+        return self.artifacts_dir / f".{session_id}.g{generation}.cand"
 
     async def write_chunk_tmp(self, session_id: str, stream: AsyncIterable[bytes]) -> tuple[Path, int, str]:
         """Stream a request body to a temp file; returns (tmp_path, size, sha256).
@@ -62,34 +105,61 @@ class ChunkStore:
         os.replace(tmp, final)
         _fsync_dir(final.parent)
 
-    def assemble_to_tmp(self, paths: Iterable[Path]) -> tuple[Path, int, str]:
-        """Concatenate chunk files in order; returns (tmp_path, size, sha256)."""
-        tmp = self.artifacts_dir / f".{uuid.uuid4().hex}.tmp"
-        hasher = hashlib.sha256()
-        size = 0
-        try:
-            with open(tmp, "wb") as out:
-                for path in paths:
-                    with open(path, "rb") as src:
-                        while True:
-                            block = src.read(_COPY_BUFFER)
-                            if not block:
-                                break
-                            hasher.update(block)
-                            out.write(block)
-                            size += len(block)
-                out.flush()
-                os.fsync(out.fileno())
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-        return tmp, size, hasher.hexdigest()
+    # ---- finalization temp file ----
 
-    def publish(self, tmp: Path, session_id: str) -> Path:
+    # ---- publishing ----
+
+    def link_candidate(self, tmp: Path, candidate: Path) -> None:
+        """Hard-link the assembled temp as a generation-tagged candidate.
+
+        The temp keeps its own link, so a crash around the rename never
+        destroys the only copy of the bytes.
+        """
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            candidate.unlink()
+        os.link(tmp, candidate)
+        _fsync_dir(candidate.parent)
+
+    def commit_candidate(self, candidate: Path, session_id: str) -> Path:
         final = self.artifact_path(session_id)
-        os.replace(tmp, final)
+        os.replace(candidate, final)
         _fsync_dir(final.parent)
         return final
+
+    @staticmethod
+    def hash_file(path: Path) -> tuple[int, str]:
+        """Stream a file in bounded buffers; returns (size, sha256)."""
+        hasher = hashlib.sha256()
+        size = 0
+        with open(path, "rb") as fh:
+            while True:
+                block = fh.read(_COPY_BUFFER)
+                if not block:
+                    break
+                hasher.update(block)
+                size += len(block)
+        return size, hasher.hexdigest()
+
+    def remove_finalize_tmp(self, session_id: str) -> None:
+        with contextlib.suppress(OSError):
+            path = self.finalize_tmp_path(session_id)
+            path.unlink(missing_ok=True)
+            _fsync_dir(path.parent)
+
+    def discard_finalization_temps(self, session_id: str) -> None:
+        """Remove every assembly temp (stable + all generations) for a session."""
+        for pattern in (f"{session_id}.tmp", f"{session_id}.g*.tmp"):
+            for entry in self.finalize_dir.glob(pattern):
+                with contextlib.suppress(OSError):
+                    entry.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            _fsync_dir(self.finalize_dir)
+
+    def remove_candidate(self, candidate: Path) -> None:
+        with contextlib.suppress(OSError):
+            candidate.unlink(missing_ok=True)
+            _fsync_dir(candidate.parent)
 
     @staticmethod
     def discard(path: Path) -> None:
@@ -98,7 +168,13 @@ class ChunkStore:
         except OSError:
             pass
 
-    def purge_tmp(self) -> None:
+    def purge_orphan_temps(self) -> None:
+        """Remove legacy assembly temps from the artifacts dir.
+
+        The current protocol never writes temp files here (they live under
+        ``.finalize/``); generation candidates carry a ``.cand`` suffix and are
+        converged per session, not swept.
+        """
         for entry in self.artifacts_dir.glob("*.tmp"):
             entry.unlink(missing_ok=True)
 

@@ -1,27 +1,48 @@
-"""Core upload/resume/finalize logic shared by the HTTP routes."""
+"""Core upload/resume/finalize logic shared by the HTTP routes.
+
+Finalization is coordinated by a durable, per-session protocol row
+(``finalizations`` table): a strictly increasing fence generation, a
+database-clock lease and a confirmed-byte checkpoint together make the
+operation safe across process crashes and across concurrent takeover.
+"""
 
 from __future__ import annotations
 
+import json
 import re
+import typing
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterable
 
-from . import clock
+from . import clock, finalization
 from .bitmap import count_set, missing_indices, new_bitmap, set_bit
 from .db import Database
 from .errors import ApiError
+from .finalization import (
+    FAULT_KILL_AFTER_INTENT,
+    FAULT_KILL_AFTER_LINK,
+    FAULT_KILL_AFTER_RENAME,
+    FenceLost,
+    ProtocolSettings,
+    RecoveryBroken,
+)
 from .schemas import CreateSessionRequest
-from .storage import ChunkStore
+from .sha256state import ResumableSHA256
+from .storage import CheckpointFileError, ChunkStore
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHECKPOINT_SCHEMA_VERSION = 1
+RECOVERY_ERROR_CODE = "FINALIZATION_RECOVERY_ERROR"
 
 
 class UploadService:
-    def __init__(self, db: Database, store: ChunkStore):
+    def __init__(self, db: Database, store: ChunkStore, data_dir: Path):
         self.db = db
         self.store = store
+        self.data_dir = data_dir
+        self.protocol = ProtocolSettings()
 
     # ---- sessions ----
 
@@ -151,10 +172,18 @@ class UploadService:
             if not committed:
                 self.store.discard(tmp)
 
-    # ---- finalize / artifact ----
+    # ---- finalize ----
 
     def finalize(self, session_id: str) -> dict:
         session = self.get_session_or_404(session_id)
+
+        row = self.db.get_finalization(session_id)
+        if row is not None:
+            if row["phase"] == "completed":
+                return self._completed_receipt_or_raise(session, row)
+            if row["phase"] == "failed":
+                self._raise_stored_failure(row)
+
         if session["status"] == "completed" and self.store.artifact_path(session_id).exists():
             return self._finalize_receipt(session)
 
@@ -190,24 +219,244 @@ class UploadService:
                 {"missing_chunks": lost, "total_chunks": total},
             )
 
-        tmp, size, digest = self.store.assemble_to_tmp(paths)
+        # First call: create the protocol row at generation 0 with no lease.
+        if row is None:
+            self.db.create_finalization(
+                {
+                    "session_id": session_id,
+                    "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                    "fence_generation": 0,
+                    "phase": "assembling",
+                    "confirmed_bytes": 0,
+                    "total_bytes": session["file_size"],
+                    "declared_sha256": session["file_sha256"],
+                    "tmp_path": str(self.store.finalize_tmp_path(session_id)),
+                    "updated_at": clock.utcnow().isoformat(),
+                }
+            )
+
+        owner = uuid.uuid4().hex
+        lease_ms = int(self.protocol.lease_seconds * 1000)
+        acquired = self.db.acquire_finalization(
+            session_id,
+            owner,
+            clock.utcnow().isoformat(),
+            lease_ms,
+        )
+        if acquired is None:
+            raise self._in_progress_error(self.db.get_finalization(session_id))
+
+        generation = acquired["fence_generation"]
+        try:
+            return self._run_finalization(session, acquired, owner, paths)
+        except FenceLost:
+            current = self.db.get_finalization(session_id)
+            if current is not None and current["phase"] == "completed":
+                return self._completed_receipt_or_raise(session, current)
+            if current is not None and current["phase"] == "failed":
+                self._raise_stored_failure(current)
+            raise self._in_progress_error(current)
+        except ApiError:
+            # Structured outcomes (422, recovery failure) already settled the
+            # row and released/cleared the lease inside _run_finalization.
+            raise
+        except BaseException:
+            # An in-process failure (not a kill) must not pin the lease until
+            # it times out; a crash obviously cannot run this.
+            self.db.release_lease(session_id, generation, owner)
+            raise
+
+    def _run_finalization(self, session: dict, row: dict, owner: str, paths: list[Path]) -> dict:
+        session_id = session["session_id"]
+        generation = row["fence_generation"]
+
+        def renew() -> None:
+            if not self.db.renew_lease(
+                session_id,
+                generation,
+                owner,
+                int(self.protocol.lease_seconds * 1000),
+            ):
+                raise FenceLost()
+
+        def save_checkpoint(confirmed: int, state: str) -> bool:
+            return self.db.save_checkpoint(
+                session_id,
+                generation,
+                owner,
+                confirmed,
+                state,
+                clock.utcnow().isoformat(),
+            )
+
+        # Crash/takeover window "artifact renamed, completion txn not yet
+        # committed": a verified artifact at the final path converges
+        # directly — never re-assembled.
+        artifact = self.store.artifact_path(session_id)
+        if artifact.exists() and self._artifact_matches(session, artifact):
+            completed_at = clock.utcnow().isoformat()
+            if self.db.mark_both_completed(
+                session_id, generation, owner, completed_at, session["file_sha256"], str(artifact)
+            ):
+                self._post_publish_cleanup(session_id, generation)
+                return self._finalize_receipt(self.get_session_or_404(session_id))
+            raise FenceLost()
+
+        gen_tmp: Path | None = None
+        size = digest = 0
+        try:
+            confirmed = row["confirmed_bytes"]
+            previous_tmp, previous_gen = self._latest_existing_tmp(session_id, generation)
+            if confirmed and previous_tmp is None:
+                raise RecoveryBroken(
+                    RECOVERY_ERROR_CODE,
+                    "finalization temp file is missing but the checkpoint confirms bytes",
+                    {"reason": "tmp_missing", "confirmed_bytes": confirmed},
+                )
+            if previous_tmp is not None:
+                self._validate_tmp_prefix(previous_tmp, confirmed)
+            if previous_tmp is None:
+                source_tmp = self.store.finalize_tmp_path(session_id)
+            else:
+                source_tmp = previous_tmp
+            if previous_gen == generation:
+                # This same generation already owns a temp (e.g. resuming
+                # within one call after a dead publishing attempt): reuse it;
+                # open_generation_tmp drops any unconfirmed tail.
+                gen_tmp = source_tmp
+            else:
+                # Takeover or restart: clone only the confirmed prefix into a
+                # fresh generation-owned inode so stale owners can't interleave.
+                gen_tmp = finalization.clone_confirmed_prefix(
+                    self.store, session_id, source_tmp, generation, confirmed
+                )
+            self._validate_hasher_state(row["hasher_state"], confirmed)
+
+            size, digest = finalization.stream_assemble(
+                data_dir=self.data_dir,
+                session=session,
+                source_paths=paths,
+                tmp_path=gen_tmp,
+                confirmed_bytes=confirmed,
+                hasher_state=row["hasher_state"],
+                settings=self.protocol,
+                renew=renew,
+                save_checkpoint=save_checkpoint,
+                fault_session_id=session_id,
+                gate=finalization.gate_for(self.data_dir),
+            )
+        except RecoveryBroken as exc:
+            self._record_recovery_failure(session_id, generation, owner, exc)
+        except CheckpointFileError as exc:
+            self._record_recovery_failure(
+                session_id,
+                generation,
+                owner,
+                RecoveryBroken(
+                    RECOVERY_ERROR_CODE,
+                    "finalization temp file does not match the persisted checkpoint",
+                    {
+                        "reason": exc.reason,
+                        "confirmed_bytes": exc.expected,
+                        "tmp_bytes": exc.actual,
+                    },
+                ),
+            )
+
         if size != session["file_size"] or digest != session["file_sha256"]:
-            self.store.discard(tmp)
-            raise ApiError(
-                422,
+            details = {
+                "declared_sha256": session["file_sha256"],
+                "assembled_sha256": digest,
+                "declared_size": session["file_size"],
+                "assembled_size": size,
+            }
+            self._fail_finalization(
+                session_id,
+                generation,
+                owner,
                 "INTEGRITY_MISMATCH",
                 "assembled file does not match the declared SHA-256; uploaded chunks are kept",
-                {
-                    "declared_sha256": session["file_sha256"],
-                    "assembled_sha256": digest,
-                    "declared_size": session["file_size"],
-                    "assembled_size": size,
-                },
+                details,
             )
-        final = self.store.publish(tmp, session_id)
+            self.store.discard(gen_tmp)
+            self.store.remove_candidate(self.store.candidate_path(session_id, generation))
+            finalization.cleanup_old_generations(self.store, session_id, generation)
+            raise ApiError(422, "INTEGRITY_MISMATCH",
+                           "assembled file does not match the declared SHA-256; uploaded chunks are kept",
+                           details)
+
+        # ---- publishing: every window below is crash-recoverable ----
+        if not self.db.set_phase(
+            session_id, generation, owner, "publishing", clock.utcnow().isoformat()
+        ):
+            raise FenceLost()
+
+        candidate = self.store.candidate_path(session_id, generation)
+        self.store.link_candidate(gen_tmp, candidate)
+        finalization.fire_kill(self.data_dir, FAULT_KILL_AFTER_LINK, session_id)
+
+        if not self.db.set_phase(
+            session_id,
+            generation,
+            owner,
+            "publishing",
+            clock.utcnow().isoformat(),
+            publish_intent=True,
+        ):
+            raise FenceLost()
+        finalization.fire_kill(self.data_dir, FAULT_KILL_AFTER_INTENT, session_id)
+
+        final = self.store.commit_candidate(candidate, session_id)
+        finalization.fire_kill(self.data_dir, FAULT_KILL_AFTER_RENAME, session_id)
+
         completed_at = clock.utcnow().isoformat()
-        self.db.mark_completed(session_id, completed_at, digest, str(final))
+        if not self.db.mark_both_completed(
+            session_id, generation, owner, completed_at, digest, str(final)
+        ):
+            # Renamed but our transaction was fenced out: the new owner is
+            # responsible for converging; the artifact bytes are identical.
+            raise FenceLost()
+
+        self.store.remove_finalize_tmp(session_id)
+        self.store.discard(gen_tmp)
+        finalization.cleanup_old_generations(self.store, session_id, generation)
         return self._finalize_receipt(self.get_session_or_404(session_id))
+
+    # ---- read-only finalization progress ----
+
+    def finalization_status(self, session_id: str) -> dict:
+        self.get_session_or_404(session_id)
+        row = self.db.get_finalization(session_id)
+        if row is None:
+            return {
+                "session_id": session_id,
+                "state": "idle",
+                "confirmed_bytes": 0,
+                "total_bytes": 0,
+                "generation": 0,
+                "last_error": None,
+            }
+        last_error = None
+        if row["last_error_code"]:
+            try:
+                payload = json.loads(row["last_error"] or "{}")
+            except (ValueError, TypeError):
+                payload = {}
+            last_error = {
+                "code": row["last_error_code"],
+                "message": payload.get("message", row["last_error"]),
+                "details": payload.get("details", {}),
+            }
+        return {
+            "session_id": session_id,
+            "state": row["phase"],
+            "confirmed_bytes": row["confirmed_bytes"],
+            "total_bytes": row["total_bytes"],
+            "generation": row["fence_generation"],
+            "last_error": last_error,
+        }
+
+    # ---- artifact ----
 
     def artifact_file(self, session_id: str) -> tuple[Path, str]:
         session = self.get_session_or_404(session_id)
@@ -294,17 +543,171 @@ class UploadService:
             "completed_at": session["completed_at"],
         }
 
+    # ---- finalization internals ----
 
-def reconcile(db: Database, store: ChunkStore) -> None:
+    def _latest_existing_tmp(self, session_id: str, below_generation: int) -> tuple[Path | None, int]:
+        best: Path | None = None
+        best_gen = -1
+        for entry in self.store.finalize_dir.glob(f"{session_id}.g*.tmp"):
+            try:
+                gen = int(entry.name.split(".g", 1)[1].split(".", 1)[0])
+            except (IndexError, ValueError):
+                continue
+            if gen < below_generation and gen > best_gen and entry.exists():
+                best, best_gen = entry, gen
+        if best is not None:
+            return best, best_gen
+        stable = self.store.finalize_tmp_path(session_id)
+        return (stable, -1) if stable.exists() else (None, -1)
+
+    @staticmethod
+    def _validate_tmp_prefix(tmp: Path, confirmed: int) -> None:
+        actual = tmp.stat().st_size
+        if actual < confirmed:
+            raise RecoveryBroken(
+                RECOVERY_ERROR_CODE,
+                "finalization temp file is shorter than the confirmed checkpoint",
+                {
+                    "reason": "tmp_shorter_than_checkpoint",
+                    "confirmed_bytes": confirmed,
+                    "tmp_bytes": actual,
+                },
+            )
+
+    @staticmethod
+    def _validate_hasher_state(state: str | None, confirmed: int) -> None:
+        if not state:
+            if confirmed:
+                raise RecoveryBroken(
+                    RECOVERY_ERROR_CODE,
+                    "checkpoint confirms bytes but records no SHA-256 state",
+                    {"reason": "missing_hasher_state", "confirmed_bytes": confirmed},
+                )
+            return
+        try:
+            hasher = ResumableSHA256.from_state(state)
+        except ValueError as exc:
+            raise RecoveryBroken(
+                RECOVERY_ERROR_CODE,
+                "persisted SHA-256 checkpoint is unreadable or of an unknown version",
+                {"reason": "bad_hasher_state", "detail": str(exc)},
+            ) from exc
+        if hasher.length != confirmed:
+            raise RecoveryBroken(
+                RECOVERY_ERROR_CODE,
+                "checkpoint byte count disagrees with the persisted SHA-256 state",
+                {
+                    "reason": "hasher_length_mismatch",
+                    "confirmed_bytes": confirmed,
+                    "hasher_bytes": hasher.length,
+                },
+            )
+
+    def _record_recovery_failure(
+        self, session_id: str, generation: int, owner: str, exc: RecoveryBroken
+    ) -> typing.NoReturn:
+        ok = self.db.mark_finalization_failed(
+            session_id,
+            generation,
+            owner,
+            exc.code,
+            json.dumps({"message": exc.message, "details": exc.details}),
+            clock.utcnow().isoformat(),
+        )
+        if not ok:
+            self.db.converge_failed(
+                session_id,
+                exc.code,
+                json.dumps({"message": exc.message, "details": exc.details}),
+                clock.utcnow().isoformat(),
+            )
+        # Never leave a downloadable artifact behind a failed finalization.
+        self.store.discard(self.store.artifact_path(session_id))
+        raise ApiError(500, exc.code, exc.message, exc.details)
+
+    def _fail_finalization(
+        self, session_id: str, generation: int, owner: str, code: str, message: str, details: dict
+    ) -> None:
+        self.db.mark_finalization_failed(
+            session_id,
+            generation,
+            owner,
+            code,
+            json.dumps({"message": message, "details": details}),
+            clock.utcnow().isoformat(),
+        )
+
+    def _raise_stored_failure(self, row: dict) -> typing.NoReturn:
+        code = row["last_error_code"] or "FINALIZATION_FAILED"
+        try:
+            payload = json.loads(row["last_error"] or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        message = payload.get("message", "finalization previously failed")
+        details = payload.get("details", {})
+        status = 422 if code == "INTEGRITY_MISMATCH" else 500
+        raise ApiError(status, code, message, details)
+
+    def _completed_receipt_or_raise(self, session: dict, row: dict) -> dict:
+        final = self.store.artifact_path(session["session_id"])
+        if not final.exists():
+            raise ApiError(
+                500,
+                RECOVERY_ERROR_CODE,
+                "finalization is recorded as completed but the artifact is missing",
+                {"reason": "artifact_missing"},
+            )
+        refreshed = self.get_session_or_404(session["session_id"])
+        if refreshed["status"] != "completed":
+            # Defensive: converge the session row to the verified final state.
+            self.db.converge_completed(
+                session["session_id"], clock.utcnow().isoformat(),
+                row["final_digest"], str(final),
+            )
+            refreshed = self.get_session_or_404(session["session_id"])
+        return self._finalize_receipt(refreshed)
+
+    def _in_progress_error(self, row: dict | None) -> ApiError:
+        details: dict = {"generation": row["fence_generation"] if row else 0}
+        if row is not None:
+            details["phase"] = row["phase"]
+            lease_until = row["lease_until"]
+            if lease_until is not None:
+                now_ms = clock.utcnow().timestamp() * 1000
+                wait_seconds = max(0.0, (lease_until - now_ms) / 1000.0)
+                retry_at = datetime.fromtimestamp(lease_until / 1000.0, tz=timezone.utc)
+                details["retry_at"] = retry_at.isoformat()
+                details["retry_after_seconds"] = round(wait_seconds, 3)
+        return ApiError(
+            409,
+            "FINALIZATION_IN_PROGRESS",
+            "another finalization attempt holds the lease for this session",
+            details,
+        )
+
+    def _post_publish_cleanup(self, session_id: str, generation: int) -> None:
+        self.store.remove_finalize_tmp(session_id)
+        for tmp in self.store.finalize_dir.glob(f"{session_id}.g*.tmp"):
+            self.store.discard(tmp)
+        finalization.cleanup_old_generations(self.store, session_id, generation)
+
+    def _artifact_matches(self, session: dict, path: Path) -> bool:
+        try:
+            size, digest = self.store.hash_file(path)
+        except OSError:
+            return False
+        return size == session["file_size"] and digest == session["file_sha256"]
+
+
+def reconcile(db: Database, store: ChunkStore, data_dir: Path) -> None:
     """Rebuild durable state after a (possibly unclean) restart.
 
     - chunk rows whose files vanished or have a wrong size are dropped;
     - chunk files without a matching row (crashed before commit) are removed;
     - the persisted bitmap is rebuilt from the surviving rows;
-    - leftover temp files are removed.
-
-    Net effect: confirmed chunks are never reported missing, and unconfirmed
-    bytes are never reported as received.
+    - leftover chunk temp files are removed;
+    - finalization protocol rows are converged across every crash window
+      (assembly checkpoint, publish intent, atomic rename, completion txn).
     """
     for session in db.list_sessions():
         session_id = session["session_id"]
@@ -332,4 +735,213 @@ def reconcile(db: Database, store: ChunkStore) -> None:
         for index in confirmed:
             set_bit(bitmap, index)
         db.update_bitmap(session_id, bytes(bitmap))
-    store.purge_tmp()
+    store.purge_orphan_temps()
+    recover_finalizations(db, store)
+
+
+def recover_finalizations(db: Database, store: ChunkStore) -> None:
+    """Crash-window convergence for every persisted finalization row.
+
+    Only a file whose length AND sha-256 match the archived values can be
+    converged to ``completed``; nothing half-written is ever exposed for
+    download and a completed rename never triggers re-assembly.
+    """
+    existing = {row["session_id"] for row in db.list_finalizations()}
+    for session in db.list_sessions():
+        # Backfill metadata for sessions completed before the in-place
+        # migration: historical artifacts stay queryable and downloadable, no
+        # re-upload and no re-assembly.
+        if session["session_id"] not in existing and session["status"] == "completed":
+            artifact = store.artifact_path(session["session_id"])
+            if artifact.exists() and _matches(session, artifact):
+                db.ensure_completed_finalization(
+                    {
+                        "session_id": session["session_id"],
+                        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                        "fence_generation": 0,
+                        "confirmed_bytes": session["file_size"],
+                        "total_bytes": session["file_size"],
+                        "declared_sha256": session["file_sha256"],
+                        "final_digest": session["final_sha256"] or session["file_sha256"],
+                        "updated_at": clock.utcnow().isoformat(),
+                    }
+                )
+
+    for row in db.list_finalizations():
+        session = db.get_session(row["session_id"])
+        if session is None:
+            continue
+        sid = row["session_id"]
+        phase = row["phase"]
+        now = clock.utcnow().isoformat()
+        artifact = store.artifact_path(sid)
+
+        if phase == "completed":
+            if artifact.exists() and _matches(session, artifact):
+                if session["status"] != "completed":
+                    db.converge_completed(sid, now, row["final_digest"], str(artifact))
+                # Crash between the completion commit and file cleanup.
+                store.discard_finalization_temps(sid)
+                for cand in store.artifacts_dir.glob(f".{sid}.g*.cand"):
+                    store.remove_candidate(cand)
+                continue
+            # Recorded completed without a matching artifact: do not guess.
+            db.converge_failed(
+                sid,
+                RECOVERY_ERROR_CODE,
+                json.dumps(
+                    {
+                        "message": "completed artifact is missing or corrupt",
+                        "details": {"reason": "artifact_missing_or_corrupt"},
+                    }
+                ),
+                now,
+            )
+            continue
+
+        if phase == "failed":
+            # A failed finalization must never have a downloadable artifact,
+            # and stale assembly/publish files must not be mistaken for state.
+            if artifact.exists():
+                store.discard(artifact)
+            candidate = store.candidate_path(sid, row["fence_generation"])
+            store.remove_candidate(candidate)
+            continue
+
+        if phase == "publishing":
+            _recover_publishing(db, store, session, row, now)
+            continue
+
+        if phase == "assembling":
+            _recover_assembling(db, store, row, now)
+
+
+def _matches(session: dict, path: Path) -> bool:
+    try:
+        size, digest = ChunkStore.hash_file(path)
+    except OSError:
+        return False
+    return size == session["file_size"] and digest == session["file_sha256"]
+
+
+def _recover_publishing(db: Database, store: ChunkStore, session: dict, row: dict, now: str) -> None:
+    sid = row["session_id"]
+    gen = row["fence_generation"]
+    candidate = store.candidate_path(sid, gen)
+    artifact = store.artifact_path(sid)
+
+    if artifact.exists():
+        if _matches(session, artifact):
+            # Renamed (intent or not) and bytes verified: converge, no rebuild.
+            db.converge_completed(sid, now, session["file_sha256"], str(artifact))
+            store.remove_candidate(candidate)
+            store.remove_finalize_tmp(sid)
+            return
+        # A file at the download path that does not match the archive values
+        # must never be served; move it aside and resume from the checkpoint.
+        store.discard(artifact)
+
+    if candidate.exists() and _matches(session, candidate):
+        final = store.commit_candidate(candidate, sid)
+        db.converge_completed(sid, now, session["file_sha256"], str(final))
+        store.remove_finalize_tmp(sid)
+        return
+
+    # No verified publishable file: resume assembly from the last checkpoint;
+    # the assembled temp and resumable digest state are still in place.
+    store.remove_candidate(candidate)
+    _recover_assembling(db, store, row, now, allow_reset=True)
+
+
+def _recover_assembling(
+    db: Database, store: ChunkStore, row: dict, now: str, *, allow_reset: bool = False
+) -> None:
+    sid = row["session_id"]
+    confirmed = row["confirmed_bytes"]
+    tmp = _latest_existing_tmp(store, sid)
+
+    try:
+        if row["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+            raise RecoveryBroken(
+                RECOVERY_ERROR_CODE,
+                f"unknown checkpoint schema version: {row['schema_version']}",
+                {"reason": "unknown_checkpoint_version", "schema_version": row["schema_version"]},
+            )
+        if confirmed:
+            if tmp is None:
+                raise RecoveryBroken(
+                    RECOVERY_ERROR_CODE,
+                    "finalization temp file is missing but the checkpoint confirms bytes",
+                    {"reason": "tmp_missing", "confirmed_bytes": confirmed},
+                )
+            actual = tmp.stat().st_size
+            if actual < confirmed:
+                raise RecoveryBroken(
+                    RECOVERY_ERROR_CODE,
+                    "finalization temp file is shorter than the confirmed checkpoint",
+                    {
+                        "reason": "tmp_shorter_than_checkpoint",
+                        "confirmed_bytes": confirmed,
+                        "tmp_bytes": actual,
+                    },
+                )
+        state = row["hasher_state"]
+        if state:
+            hasher = ResumableSHA256.from_state(state)  # raises ValueError if corrupt
+            if hasher.length != confirmed:
+                raise RecoveryBroken(
+                    RECOVERY_ERROR_CODE,
+                    "checkpoint byte count disagrees with the persisted SHA-256 state",
+                    {
+                        "reason": "hasher_length_mismatch",
+                        "confirmed_bytes": confirmed,
+                        "hasher_bytes": hasher.length,
+                    },
+                )
+        elif confirmed:
+            raise RecoveryBroken(
+                RECOVERY_ERROR_CODE,
+                "checkpoint confirms bytes but records no SHA-256 state",
+                {"reason": "missing_hasher_state", "confirmed_bytes": confirmed},
+            )
+    except RecoveryBroken as exc:
+        db.converge_failed(sid, exc.code,
+                           json.dumps({"message": exc.message, "details": exc.details}), now)
+        return
+    except ValueError as exc:
+        db.converge_failed(
+            sid,
+            RECOVERY_ERROR_CODE,
+            json.dumps(
+                {
+                    "message": "persisted SHA-256 checkpoint is unreadable or of an unknown version",
+                    "details": {"reason": "bad_hasher_state", "detail": str(exc)},
+                }
+            ),
+            now,
+        )
+        return
+
+    # State is consistent: any process death left a dead lease behind; clear it
+    # so the next request acquires immediately, and keep assembling (or reset a
+    # stale publishing attempt that was passed in from _recover_publishing).
+    if allow_reset:
+        db.reset_to_assembling(sid, now)
+    else:
+        db.clear_lease(sid)
+
+
+def _latest_existing_tmp(store: ChunkStore, session_id: str) -> Path | None:
+    best: Path | None = None
+    best_gen = -1
+    for entry in store.finalize_dir.glob(f"{session_id}.g*.tmp"):
+        try:
+            gen = int(entry.name.split(".g", 1)[1].split(".", 1)[0])
+        except (IndexError, ValueError):
+            continue
+        if gen > best_gen and entry.exists():
+            best, best_gen = entry, gen
+    if best is not None:
+        return best
+    stable = store.finalize_tmp_path(session_id)
+    return stable if stable.exists() else None

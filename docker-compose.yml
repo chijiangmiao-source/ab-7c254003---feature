@@ -4,10 +4,18 @@ services:
     image: chunked-upload-api:latest
     environment:
       DATA_DIR: /data
+      # Small enough that the acceptance file (5 chunks / ~4 MiB) crosses real
+      # durable checkpoints, which the verify client then crashes across.
+      FINALIZE_CHECKPOINT_BYTES: "1048576"
+      FINALIZE_LEASE_SECONDS: "15"
     volumes:
       - upload-data:/data
     ports:
       - "${API_PORT:-8000}:8000"
+    # The acceptance harness kills the API process with SIGKILL at exact
+    # finalization crash windows; the policy restarts it so the same volume is
+    # recovered by a fresh process.
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
       interval: 2s
@@ -23,6 +31,12 @@ services:
         condition: service_healthy
     environment:
       API_BASE_URL: http://api:8000
+      DATA_DIR: /data
+      # Shares the API volume so it can arm one-shot crash faults and observe
+      # cross-process convergence.
+      RECOVERY_SCENARIOS: "1"
+    volumes:
+      - upload-data:/data
     command: ["python", "-m", "app.verify"]
     restart: "no"
 
